@@ -85,11 +85,14 @@ public:
   /// Indicates where the odometry info is coming from
   enum OdomSource
   {
-    /// Use an ancoder
+    /// Use an encoder
     ENCODER = 0,
 
     /// Use ground truth from simulation world
     WORLD = 1,
+
+    /// Use the parametric error model from Probabilistic Robotics (3rd Ed.) p. 136
+    PARAMETRIC_ERROR_MODEL = 2,
   };
 
   /// Indicates which wheel
@@ -118,13 +121,23 @@ public:
   void UpdateOdometryEncoder(const gazebo::common::Time & _current_time);
 
   /// Update odometry according to world
+  void UpdateGroundTruthWorld();
+
+  /// Update odometry according to world
   void UpdateOdometryWorld();
+
+  /// Update odometry according parametric error model
+  void UpdateOdometryParametricErrorModel(const gazebo::common::Time & _current_time);
 
   /// Publish odometry transforms
   /// \param[in] _current_time Current simulation time
   void PublishOdometryTf(const gazebo::common::Time & _current_time);
 
-  /// Publish trasforms for the wheels
+  /// Publish ground truth transforms
+  /// \param[in] _current_time Current simulation time
+  void PublishGroundTruthTf(const gazebo::common::Time & _current_time);
+
+  /// Publish transforms for the wheels
   /// \param[in] _current_time Current simulation time
   void PublishWheelsTf(const gazebo::common::Time & _current_time);
 
@@ -189,23 +202,44 @@ public:
   /// Keep encoder data.
   geometry_msgs::msg::Pose2D pose_encoder_;
 
-  /// Odometry frame ID
+  /// Keep latest world odometry pose
+  geometry_msgs::msg::Pose2D last_pose_;
+
+  /// Keep odometry pose from error model
+  geometry_msgs::msg::Pose2D pose_error_model_;
+
+    /// Odometry frame ID
   std::string odometry_frame_;
+
+    /// Ground truth parent frame ID
+  std::string ground_truth_parent_frame_;
+
+    /// Ground truth robot base frame ID
+  std::string ground_truth_robot_base_frame_;
 
   /// Last time the encoder was updated
   gazebo::common::Time last_encoder_update_;
 
-  /// Either ENCODER or WORLD
+  /// Last time the odometry error model was updated
+  gazebo::common::Time last_odometry_error_model_update_;
+
+  /// Either ENCODER, WORLD or PARAMETRIC_ERROR_MODEL
   OdomSource odom_source_;
 
   /// Keep latest odometry message
   nav_msgs::msg::Odometry odom_;
+
+  /// Keep latest odometry message
+  nav_msgs::msg::Odometry ground_truth_odom_;
 
   /// Robot base frame ID
   std::string robot_base_frame_;
 
   /// True to publish odometry messages.
   bool publish_odom_;
+
+  /// True to publish ground truth odometry messages.
+  bool publish_ground_truth_tf_;
 
   /// True to publish wheel-to-base transforms.
   bool publish_wheel_tf_;
@@ -218,6 +252,10 @@ public:
 
   /// Covariance in odometry
   double covariance_[3];
+
+  /// Parameters of odometry error model
+  double alpha1_, alpha2_, alpha3_, alpha4_;
+
 };
 
 GazeboRosDiffDrive::GazeboRosDiffDrive()
@@ -350,6 +388,31 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   impl_->odom_source_ = static_cast<GazeboRosDiffDrivePrivate::OdomSource>(
     _sdf->Get<int>("odometry_source", 1).first);
 
+  // Ground truth
+  impl_->publish_ground_truth_tf_ = _sdf->Get<bool>("publish_ground_truth_tf", false).first;
+  impl_->ground_truth_parent_frame_ = _sdf->Get<std::string>("ground_truth_parent_frame", "map").first;
+  impl_->ground_truth_robot_base_frame_ = _sdf->Get<std::string>("ground_truth_robot_base_frame", "base_footprint_gt").first;
+
+  // Odometry error model parameters
+  if (impl_->odom_source_ == GazeboRosDiffDrivePrivate::OdomSource::PARAMETRIC_ERROR_MODEL)
+  {
+    impl_->alpha1_ = _sdf->Get<double>("alpha1", 0.001).first;
+    impl_->alpha2_ = _sdf->Get<double>("alpha2", 0.001).first;
+    impl_->alpha3_ = _sdf->Get<double>("alpha3", 0.001).first;
+    impl_->alpha4_ = _sdf->Get<double>("alpha4", 0.001).first;
+
+    RCLCPP_INFO(impl_->ros_node_->get_logger(),
+                "Computing odometry with parametric error model\n"
+                "alpha1 [%f]\n"
+                "alpha2 [%f]\n"
+                "alpha3 [%f]\n"
+                "alpha4 [%f]\n",
+                impl_->alpha1_,
+                impl_->alpha2_,
+                impl_->alpha3_,
+                impl_->alpha4_);
+  }
+
   // Advertise odometry topic
   impl_->publish_odom_ = _sdf->Get<bool>("publish_odom", false).first;
   if (impl_->publish_odom_) {
@@ -363,9 +426,8 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   // Create TF broadcaster if needed
   impl_->publish_wheel_tf_ = _sdf->Get<bool>("publish_wheel_tf", false).first;
   impl_->publish_odom_tf_ = _sdf->Get<bool>("publish_odom_tf", false).first;
-  if (impl_->publish_wheel_tf_ || impl_->publish_odom_tf_) {
-    impl_->transform_broadcaster_ =
-      std::make_shared<tf2_ros::TransformBroadcaster>(impl_->ros_node_);
+  if (impl_->publish_wheel_tf_ || impl_->publish_odom_tf_ || impl_->publish_ground_truth_tf_) {
+    impl_->transform_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(impl_->ros_node_);
 
     if (impl_->publish_odom_tf_) {
       RCLCPP_INFO(impl_->ros_node_->get_logger(),
@@ -382,6 +444,14 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
           impl_->joints_[2 * index + GazeboRosDiffDrivePrivate::RIGHT]->GetName().c_str());
       }
     }
+
+    if (impl_->publish_ground_truth_tf_) {
+      RCLCPP_INFO(impl_->ros_node_->get_logger(),
+        "Publishing ground truth odom transforms between [%s] and [%s]",
+        impl_->ground_truth_parent_frame_.c_str(),
+        impl_->ground_truth_robot_base_frame_.c_str());
+    }
+
   }
 
   impl_->covariance_[0] = _sdf->Get<double>("covariance_x", 0.00001).first;
@@ -410,6 +480,12 @@ void GazeboRosDiffDrive::Reset()
   impl_->pose_encoder_.x = 0;
   impl_->pose_encoder_.y = 0;
   impl_->pose_encoder_.theta = 0;
+  impl_->last_pose_.x = 0;
+  impl_->last_pose_.y = 0;
+  impl_->last_pose_.theta = 0;
+  impl_->pose_error_model_.x = 0;
+  impl_->pose_error_model_.y = 0;
+  impl_->pose_error_model_.theta = 0;
   impl_->target_x_ = 0;
   impl_->target_rot_ = 0;
 }
@@ -419,6 +495,11 @@ void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _inf
   // Update encoder even if we're going to skip this update
   if (odom_source_ == ENCODER) {
     UpdateOdometryEncoder(_info.simTime);
+  }
+
+  // Update odom message if using parametric error model
+  if (odom_source_ == PARAMETRIC_ERROR_MODEL) {
+    UpdateOdometryParametricErrorModel(_info.simTime);
   }
 
   double seconds_since_last_update = (_info.simTime - last_update_time_).Double();
@@ -432,6 +513,11 @@ void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _inf
     UpdateOdometryWorld();
   }
 
+  // Update odom message if using ground truth
+  if (publish_ground_truth_tf_) {
+    UpdateGroundTruthWorld();
+  }
+
   if (publish_odom_) {
     PublishOdometryMsg(_info.simTime);
   }
@@ -442,6 +528,10 @@ void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _inf
 
   if (publish_odom_tf_) {
     PublishOdometryTf(_info.simTime);
+  }
+
+  if (publish_ground_truth_tf_) {
+    PublishGroundTruthTf(_info.simTime);
   }
 
   // Update robot in case new velocities have been requested
@@ -523,7 +613,7 @@ void GazeboRosDiffDrivePrivate::UpdateOdometryEncoder(const gazebo::common::Time
 
   double b = wheel_separation_[0];
 
-  // Book: Sigwart 2011 Autonompus Mobile Robots page:337
+  // Book: Sigwart 2011 Autonomous Mobile Robots page:337
   double sl = vl * (wheel_diameter_[0] / 2.0) * seconds_since_last_update;
   double sr = vr * (wheel_diameter_[0] / 2.0) * seconds_since_last_update;
   double ssum = sl + sr;
@@ -576,15 +666,107 @@ void GazeboRosDiffDrivePrivate::UpdateOdometryWorld()
   odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
 }
 
+void GazeboRosDiffDrivePrivate::UpdateGroundTruthWorld()
+{
+  auto pose = model_->WorldPose();
+  ground_truth_odom_.pose.pose.position = gazebo_ros::Convert<geometry_msgs::msg::Point>(pose.Pos());
+  ground_truth_odom_.pose.pose.orientation = gazebo_ros::Convert<geometry_msgs::msg::Quaternion>(pose.Rot());
+
+  // Get velocity in odom frame
+  auto linear = model_->WorldLinearVel();
+  ground_truth_odom_.twist.twist.angular.z = model_->WorldAngularVel().Z();
+
+  // Convert velocity to child_frame_id
+  float yaw = pose.Rot().Yaw();
+  ground_truth_odom_.twist.twist.linear.x = cosf(yaw) * linear.X() + sinf(yaw) * linear.Y();
+  ground_truth_odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
+}
+
+void GazeboRosDiffDrivePrivate::UpdateOdometryParametricErrorModel(const gazebo::common::Time & _current_time)
+{
+  auto pose = model_->WorldPose();
+  double seconds_since_last_update = (_current_time - last_odometry_error_model_update_).Double();
+  last_odometry_error_model_update_ = _current_time;
+
+  auto current_pose = geometry_msgs::msg::Pose2D();
+  current_pose.x = pose.Pos().X();
+  current_pose.y = pose.Pos().Y();
+  current_pose.theta = pose.Rot().Yaw();
+
+  auto delta = geometry_msgs::msg::Pose2D();
+  delta.x = current_pose.x - last_pose_.x;
+  delta.y = current_pose.y - last_pose_.y;
+  delta.theta = current_pose.theta - last_pose_.theta;
+  delta.theta = atan2(sin(delta.theta), cos(delta.theta));
+
+  double delta_trans = sqrt(std::pow(delta.x, 2) + std::pow(delta.y, 2));
+  double delta_rot1 = atan2(delta.y, delta.x) - last_pose_.theta;
+  delta_rot1 = atan2(sin(delta_rot1), cos(delta_rot1));
+
+  std::normal_distribution<double> delta_rot_rv(
+    delta.theta,
+    sqrt(std::pow(alpha1_ * delta.theta, 2) + std::pow(alpha2_ * delta_trans, 2))
+    );
+
+  std::normal_distribution<double> delta_trans_rv(
+    delta_trans,
+    sqrt(std::pow(alpha3_ * delta_trans, 2) + std::pow(alpha4_ * delta.theta, 2))
+    );
+
+  std::random_device rd{};
+  std::mt19937 rng{rd()};
+  double delta_rot_hat = delta_rot_rv(rng);
+  double delta_trans_hat = delta_trans_rv(rng);
+
+  // Add the delta with additional error to the odometry pose
+  pose_error_model_.x += delta_trans_hat * cos(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.y += delta_trans_hat * sin(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.theta += delta_rot_hat;
+
+  // Compute the ros odometry message and tf
+  double w = delta_rot_hat / seconds_since_last_update;
+  double v = delta_trans_hat / seconds_since_last_update;
+  tf2::Quaternion qt;
+  tf2::Vector3 vt;
+  qt.setRPY(0, 0, pose_error_model_.theta);
+  vt = tf2::Vector3(pose_error_model_.x, pose_error_model_.y, 0);
+
+  odom_.pose.pose.position.x = vt.x();
+  odom_.pose.pose.position.y = vt.y();
+  odom_.pose.pose.position.z = vt.z();
+
+  odom_.pose.pose.orientation.x = qt.x();
+  odom_.pose.pose.orientation.y = qt.y();
+  odom_.pose.pose.orientation.z = qt.z();
+  odom_.pose.pose.orientation.w = qt.w();
+
+  odom_.twist.twist.angular.z = w;
+  odom_.twist.twist.linear.x = v;
+  odom_.twist.twist.linear.y = 0;
+
+  last_pose_ = current_pose;
+}
+
 void GazeboRosDiffDrivePrivate::PublishOdometryTf(const gazebo::common::Time & _current_time)
 {
   geometry_msgs::msg::TransformStamped msg;
   msg.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(_current_time);
   msg.header.frame_id = odometry_frame_;
   msg.child_frame_id = robot_base_frame_;
-  msg.transform.translation =
-    gazebo_ros::Convert<geometry_msgs::msg::Vector3>(odom_.pose.pose.position);
+  msg.transform.translation = gazebo_ros::Convert<geometry_msgs::msg::Vector3>(odom_.pose.pose.position);
   msg.transform.rotation = odom_.pose.pose.orientation;
+
+  transform_broadcaster_->sendTransform(msg);
+}
+
+void GazeboRosDiffDrivePrivate::PublishGroundTruthTf(const gazebo::common::Time & _current_time)
+{
+  geometry_msgs::msg::TransformStamped msg;
+  msg.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(_current_time);
+  msg.header.frame_id = ground_truth_parent_frame_;
+  msg.child_frame_id = ground_truth_robot_base_frame_;
+  msg.transform.translation = gazebo_ros::Convert<geometry_msgs::msg::Vector3>(ground_truth_odom_.pose.pose.position);
+  msg.transform.rotation = ground_truth_odom_.pose.pose.orientation;
 
   transform_broadcaster_->sendTransform(msg);
 }
