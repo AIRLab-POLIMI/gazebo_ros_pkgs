@@ -76,7 +76,9 @@ namespace gazebo {
     {
         ENCODER = 0,
         WORLD = 1,
+        PARAMETRIC_ERROR_MODEL = 2,
     };
+
     public:
       GazeboRosDiffDrive();
       ~GazeboRosDiffDrive();
@@ -103,7 +105,7 @@ namespace gazebo {
       double wheel_diameter_;
       double wheel_torque;
       double wheel_speed_[2];
-	  double wheel_accel;
+      double wheel_accel;
       double wheel_speed_instr_[2];
 
       std::vector<physics::JointPtr> joints_;
@@ -146,10 +148,43 @@ namespace gazebo {
       geometry_msgs::Pose2D pose_encoder_;
       common::Time last_odom_update_;
 
-    // Flags
-    bool publishWheelTF_;
-    bool publishOdomTF_;
-    bool publishWheelJointState_;
+      // Flags
+      bool publishWheelTF_;
+      bool publishOdomTF_;
+      bool publishWheelJointState_;
+
+      /// Parameters of odometry error model
+      double alpha1_, alpha2_, alpha3_, alpha4_;
+
+      /// True to publish ground truth odometry messages.
+      bool publish_ground_truth_tf_;
+
+      /// Keep latest odometry message
+      nav_msgs::Odometry ground_truth_odom_;
+
+      /// Ground truth parent frame ID
+      std::string ground_truth_parent_frame_;
+
+      /// Ground truth robot base frame ID
+      std::string ground_truth_robot_base_frame_;
+
+      /// Keep odometry pose from error model
+      geometry_msgs::Pose2D pose_error_model_;
+
+      /// Keep latest world odometry pose
+      geometry_msgs::Pose2D last_pose_;
+
+      /// Last time the odometry error model was updated
+      gazebo::common::Time last_odometry_error_model_update_;
+
+      /// Update odometry according parametric error model
+      void UpdateOdometryParametricErrorModel();
+
+      /// Update odometry according to world
+      void UpdateGroundTruthWorld();
+
+      /// Publish ground truth transforms
+      void PublishGroundTruthTf();
 
   };
 

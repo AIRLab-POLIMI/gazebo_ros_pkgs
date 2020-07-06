@@ -79,7 +79,6 @@ GazeboRosDiffDrive::~GazeboRosDiffDrive()
 // Load the controller
 void GazeboRosDiffDrive::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf )
 {
-
     this->parent = _parent;
     gazebo_ros_ = GazeboRosPtr ( new GazeboRos ( _parent, _sdf, "DiffDrive" ) );
     // Make sure the ROS node for Gazebo has already been initialized
@@ -100,16 +99,38 @@ void GazeboRosDiffDrive::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf 
     std::map<std::string, OdomSource> odomOptions;
     odomOptions["encoder"] = ENCODER;
     odomOptions["world"] = WORLD;
+    odomOptions["parametric_error_model"] = PARAMETRIC_ERROR_MODEL;
     gazebo_ros_->getParameter<OdomSource> ( odom_source_, "odometrySource", odomOptions, WORLD );
 
+    // Ground truth
+    gazebo_ros_->getParameter<bool> (publish_ground_truth_tf_, "publishGroundTruthTF", false );
+    gazebo_ros_->getParameter<std::string> (ground_truth_parent_frame_, "groundTruthParentFrame", "map" );
+    gazebo_ros_->getParameter<std::string> (ground_truth_robot_base_frame_, "groundTruthRobotBaseFrame", "base_footprint_gt" );
+
+    // Odometry error model parameters
+    if (odom_source_ == PARAMETRIC_ERROR_MODEL)
+    {
+      gazebo_ros_->getParameter<double> (alpha1_, "alpha1", 0.001);
+      gazebo_ros_->getParameter<double> (alpha2_, "alpha2", 0.001);
+      gazebo_ros_->getParameter<double> (alpha3_, "alpha3", 0.001);
+      gazebo_ros_->getParameter<double> (alpha4_, "alpha4", 0.001);
+
+      ROS_INFO("Computing odometry with parametric error model\n"
+               "alpha1 [%f]\n"
+               "alpha2 [%f]\n"
+               "alpha3 [%f]\n"
+               "alpha4 [%f]\n",
+               alpha1_,
+               alpha2_,
+               alpha3_,
+               alpha4_);
+    }
 
     joints_.resize ( 2 );
     joints_[LEFT] = gazebo_ros_->getJoint ( parent, "leftJoint", "left_joint" );
     joints_[RIGHT] = gazebo_ros_->getJoint ( parent, "rightJoint", "right_joint" );
     joints_[LEFT]->SetParam ( "fmax", 0, wheel_torque );
     joints_[RIGHT]->SetParam ( "fmax", 0, wheel_torque );
-
-
 
     this->publish_tf_ = true;
     if (!_sdf->HasElement("publishTf")) {
@@ -164,6 +185,7 @@ void GazeboRosDiffDrive::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf 
     {
       odometry_publisher_ = gazebo_ros_->node()->advertise<nav_msgs::Odometry>(odometry_topic_, 1);
       ROS_INFO_NAMED("diff_drive", "%s: Advertise odom on %s ", gazebo_ros_->info(), odometry_topic_.c_str());
+
     }
 
     // start custom queue for diff drive
@@ -186,6 +208,12 @@ void GazeboRosDiffDrive::Reset()
   pose_encoder_.x = 0;
   pose_encoder_.y = 0;
   pose_encoder_.theta = 0;
+  last_pose_.x = 0;
+  last_pose_.y = 0;
+  last_pose_.theta = 0;
+  pose_error_model_.x = 0;
+  pose_error_model_.y = 0;
+  pose_error_model_.theta = 0;
   x_ = 0;
   rot_ = 0;
   joints_[LEFT]->SetParam ( "fmax", 0, wheel_torque );
@@ -218,8 +246,8 @@ void GazeboRosDiffDrive::publishWheelTF()
     ros::Time current_time = ros::Time::now();
     for ( int i = 0; i < 2; i++ ) {
 
-        std::string wheel_frame = gazebo_ros_->resolveTF(joints_[i]->GetChild()->GetName ());
-        std::string wheel_parent_frame = gazebo_ros_->resolveTF(joints_[i]->GetParent()->GetName ());
+        std::string wheel_frame = joints_[i]->GetChild()->GetName ();
+        std::string wheel_parent_frame = joints_[i]->GetParent()->GetName ();
 
 #if GAZEBO_MAJOR_VERSION >= 8
         ignition::math::Pose3d poseWheel = joints_[i]->GetChild()->RelativePose();
@@ -252,8 +280,13 @@ void GazeboRosDiffDrive::UpdateChild()
       }
     }
 
-
     if ( odom_source_ == ENCODER ) UpdateOdometryEncoder();
+
+    // Update odom message if using parametric error model
+    if (odom_source_ == PARAMETRIC_ERROR_MODEL) {
+      UpdateOdometryParametricErrorModel();
+    }
+
 #if GAZEBO_MAJOR_VERSION >= 8
     common::Time current_time = parent->GetWorld()->SimTime();
 #else
@@ -262,6 +295,13 @@ void GazeboRosDiffDrive::UpdateChild()
     double seconds_since_last_update = ( current_time - last_update_time_ ).Double();
 
     if ( seconds_since_last_update > update_period_ ) {
+
+        // Update odom message if using ground truth
+        if (publish_ground_truth_tf_) {
+          UpdateGroundTruthWorld();
+          PublishGroundTruthTf();
+        }
+
         if (this->publish_tf_) publishOdometry ( seconds_since_last_update );
         if ( publishWheelTF_ ) publishWheelTF();
         if ( publishWheelJointState_ ) publishWheelJointState();
@@ -352,7 +392,7 @@ void GazeboRosDiffDrive::UpdateOdometryEncoder()
 
     double b = wheel_separation_;
 
-    // Book: Sigwart 2011 Autonompus Mobile Robots page:337
+    // Book: Sigwart 2011 Autonomous Mobile Robots page:337
     double sl = vl * ( wheel_diameter_ / 2.0 ) * seconds_since_last_update;
     double sr = vr * ( wheel_diameter_ / 2.0 ) * seconds_since_last_update;
     double ssum = sl + sr;
@@ -393,17 +433,16 @@ void GazeboRosDiffDrive::publishOdometry ( double step_time )
 {
 
     ros::Time current_time = ros::Time::now();
-    std::string odom_frame = gazebo_ros_->resolveTF ( odometry_frame_ );
-    std::string base_footprint_frame = gazebo_ros_->resolveTF ( robot_base_frame_ );
+    std::string odom_frame = odometry_frame_;
+    std::string base_footprint_frame = robot_base_frame_;
 
     tf::Quaternion qt;
     tf::Vector3 vt;
 
-    if ( odom_source_ == ENCODER ) {
-        // getting data form encoder integration
+    if ( odom_source_ == ENCODER || odom_source_ == PARAMETRIC_ERROR_MODEL) {
+        // getting data form encoder integration or parametric error model
         qt = tf::Quaternion ( odom_.pose.pose.orientation.x, odom_.pose.pose.orientation.y, odom_.pose.pose.orientation.z, odom_.pose.pose.orientation.w );
         vt = tf::Vector3 ( odom_.pose.pose.position.x, odom_.pose.pose.position.y, odom_.pose.pose.position.z );
-
     }
     if ( odom_source_ == WORLD ) {
         // getting data from gazebo world
@@ -440,7 +479,7 @@ void GazeboRosDiffDrive::publishOdometry ( double step_time )
         odom_.twist.twist.linear.y = cosf ( yaw ) * linear.Y() - sinf ( yaw ) * linear.X();
     }
 
-    if (publishOdomTF_ == true){
+    if (publishOdomTF_){
         tf::Transform base_footprint_to_odom ( qt, vt );
         transform_broadcaster_->sendTransform (
             tf::StampedTransform ( base_footprint_to_odom, current_time,
@@ -463,6 +502,135 @@ void GazeboRosDiffDrive::publishOdometry ( double step_time )
     odom_.child_frame_id = base_footprint_frame;
 
     odometry_publisher_.publish ( odom_ );
+}
+
+void GazeboRosDiffDrive::UpdateGroundTruthWorld()
+{
+
+#if GAZEBO_MAJOR_VERSION >= 8
+  ignition::math::Pose3d pose = parent->WorldPose();
+#else
+  ignition::math::Pose3d pose = parent->GetWorldPose().Ign();
+#endif
+
+  tf::Vector3 vt = tf::Vector3 ( pose.Pos().X(), pose.Pos().Y(), pose.Pos().Z() );
+  tf::Quaternion qt = tf::Quaternion ( pose.Rot().X(), pose.Rot().Y(), pose.Rot().Z(), pose.Rot().W() );
+
+  ground_truth_odom_.pose.pose.position.x = vt.x();
+  ground_truth_odom_.pose.pose.position.y = vt.y();
+  ground_truth_odom_.pose.pose.position.z = vt.z();
+
+  ground_truth_odom_.pose.pose.orientation.x = qt.x();
+  ground_truth_odom_.pose.pose.orientation.y = qt.y();
+  ground_truth_odom_.pose.pose.orientation.z = qt.z();
+  ground_truth_odom_.pose.pose.orientation.w = qt.w();
+
+  // get velocity in /odom frame
+  ignition::math::Vector3d linear;
+#if GAZEBO_MAJOR_VERSION >= 8
+  linear = parent->WorldLinearVel();
+  ground_truth_odom_.twist.twist.angular.z = parent->WorldAngularVel().Z();
+#else
+  linear = parent->GetWorldLinearVel().Ign();
+  ground_truth_odom_.twist.twist.angular.z = parent->GetWorldAngularVel().Ign().Z();
+#endif
+
+  // Convert velocity to child_frame_id
+  float yaw = pose.Rot().Yaw();
+  ground_truth_odom_.twist.twist.linear.x = cosf(yaw) * linear.X() + sinf(yaw) * linear.Y();
+  ground_truth_odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
+}
+
+void GazeboRosDiffDrive::UpdateOdometryParametricErrorModel()
+{
+#if GAZEBO_MAJOR_VERSION >= 8
+  common::Time _current_time = parent->GetWorld()->SimTime();
+#else
+  common::Time _current_time = parent->GetWorld()->GetSimTime();
+#endif
+
+#if GAZEBO_MAJOR_VERSION >= 8
+  ignition::math::Pose3d pose = parent->WorldPose();
+#else
+  ignition::math::Pose3d pose = parent->GetWorldPose().Ign();
+#endif
+  double seconds_since_last_update = (_current_time - last_odometry_error_model_update_).Double();
+  last_odometry_error_model_update_ = _current_time;
+
+  auto current_pose = geometry_msgs::Pose2D();
+  current_pose.x = pose.Pos().X();
+  current_pose.y = pose.Pos().Y();
+  current_pose.theta = pose.Rot().Yaw();
+
+  auto delta = geometry_msgs::Pose2D();
+  delta.x = current_pose.x - last_pose_.x;
+  delta.y = current_pose.y - last_pose_.y;
+  delta.theta = current_pose.theta - last_pose_.theta;
+  delta.theta = atan2(sin(delta.theta), cos(delta.theta));
+
+  double delta_trans = sqrt(std::pow(delta.x, 2) + std::pow(delta.y, 2));
+  double delta_rot1 = atan2(delta.y, delta.x) - last_pose_.theta;
+  delta_rot1 = atan2(sin(delta_rot1), cos(delta_rot1));
+
+  std::normal_distribution<double> delta_rot_rv(
+    delta.theta,
+    sqrt(std::pow(alpha1_ * delta.theta, 2) + std::pow(alpha2_ * delta_trans, 2))
+  );
+
+  std::normal_distribution<double> delta_trans_rv(
+    delta_trans,
+    sqrt(std::pow(alpha3_ * delta_trans, 2) + std::pow(alpha4_ * delta.theta, 2))
+  );
+
+  std::random_device rd{};
+  std::mt19937 rng{rd()};
+  double delta_rot_hat = delta_rot_rv(rng);
+  double delta_trans_hat = delta_trans_rv(rng);
+
+  // Add the delta with additional error to the odometry pose
+  pose_error_model_.x += delta_trans_hat * cos(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.y += delta_trans_hat * sin(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.theta += delta_rot_hat;
+
+  // Compute the ros odometry message and tf
+  double w = delta_rot_hat / seconds_since_last_update;
+  double v = delta_trans_hat / seconds_since_last_update;
+  tf2::Quaternion qt;
+  tf2::Vector3 vt;
+  qt.setRPY(0, 0, pose_error_model_.theta);
+  vt = tf2::Vector3(pose_error_model_.x, pose_error_model_.y, 0);
+
+  odom_.pose.pose.position.x = vt.x();
+  odom_.pose.pose.position.y = vt.y();
+  odom_.pose.pose.position.z = vt.z();
+
+  odom_.pose.pose.orientation.x = qt.x();
+  odom_.pose.pose.orientation.y = qt.y();
+  odom_.pose.pose.orientation.z = qt.z();
+  odom_.pose.pose.orientation.w = qt.w();
+
+  odom_.twist.twist.angular.z = w;
+  odom_.twist.twist.linear.x = v;
+  odom_.twist.twist.linear.y = 0;
+
+  last_pose_ = current_pose;
+}
+
+void GazeboRosDiffDrive::PublishGroundTruthTf()
+{
+  ros::Time _current_time = ros::Time::now();
+  tf::Quaternion qt = tf::Quaternion ( ground_truth_odom_.pose.pose.orientation.x,
+                                       ground_truth_odom_.pose.pose.orientation.y,
+                                       ground_truth_odom_.pose.pose.orientation.z,
+                                       ground_truth_odom_.pose.pose.orientation.w );
+  tf::Vector3 vt = tf::Vector3 ( ground_truth_odom_.pose.pose.position.x,
+                                 ground_truth_odom_.pose.pose.position.y,
+                                 ground_truth_odom_.pose.pose.position.z );
+  tf::Transform ground_truth_transform ( qt, vt );
+  transform_broadcaster_->sendTransform (
+    tf::StampedTransform ( ground_truth_transform, _current_time,
+                           ground_truth_parent_frame_, ground_truth_robot_base_frame_ ) );
+
 }
 
 GZ_REGISTER_MODEL_PLUGIN ( GazeboRosDiffDrive )
