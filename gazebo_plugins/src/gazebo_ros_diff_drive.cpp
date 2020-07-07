@@ -59,6 +59,7 @@
 #include <sdf/sdf.hh>
 
 #include <ros/ros.h>
+#include <std_msgs/Float32.h>
 
 namespace gazebo
 {
@@ -166,6 +167,15 @@ void GazeboRosDiffDrive::Load ( physics::ModelPtr _parent, sdf::ElementPtr _sdf 
     {
         joint_state_publisher_ = gazebo_ros_->node()->advertise<sensor_msgs::JointState>("joint_states", 1000);
         ROS_INFO_NAMED("diff_drive", "%s: Advertise joint_states", gazebo_ros_->info());
+
+        wheel_left_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_left_velocity", 1000);
+        wheel_right_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_right_velocity", 1000);
+        wheel_left_cmd_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_left_cmd_velocity", 1000);
+        wheel_right_cmd_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_right_cmd_velocity", 1000);
+        wheel_left_sp_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_left_sp_velocity", 1000);
+        wheel_right_sp_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_right_sp_velocity", 1000);
+        wheel_left_err_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_left_err_velocity", 1000);
+        wheel_right_err_velocity_publisher_ = gazebo_ros_->node()->advertise<std_msgs::Float32>("wheel_right_err_velocity", 1000);
     }
 
     transform_broadcaster_ = boost::shared_ptr<tf::TransformBroadcaster>(new tf::TransformBroadcaster());
@@ -239,6 +249,40 @@ void GazeboRosDiffDrive::publishWheelJointState()
         joint_state_.position[i] = position;
     }
     joint_state_publisher_.publish ( joint_state_ );
+
+    double current_speed[2];
+
+    current_speed[LEFT] = joints_[LEFT]->GetVelocity ( 0 )   * ( wheel_diameter_ / 2.0 );
+    current_speed[RIGHT] = joints_[RIGHT]->GetVelocity ( 0 ) * ( wheel_diameter_ / 2.0 );
+
+    std_msgs::Float32 wheel_left_velocity_msg = std_msgs::Float32();
+    wheel_left_velocity_msg.data = current_speed[LEFT];
+    wheel_left_velocity_publisher_.publish(wheel_left_velocity_msg);
+    std_msgs::Float32 wheel_right_velocity_msg = std_msgs::Float32();
+    wheel_right_velocity_msg.data = current_speed[RIGHT];
+    wheel_right_velocity_publisher_.publish(wheel_right_velocity_msg);
+
+    std_msgs::Float32 wheel_left_cmd_velocity_msg = std_msgs::Float32();
+    wheel_left_cmd_velocity_msg.data = wheel_speed_instr_[LEFT];
+    wheel_left_cmd_velocity_publisher_.publish(wheel_left_cmd_velocity_msg);
+    std_msgs::Float32 wheel_right_cmd_velocity_msg = std_msgs::Float32();
+    wheel_right_cmd_velocity_msg.data = wheel_speed_instr_[RIGHT];
+    wheel_right_cmd_velocity_publisher_.publish(wheel_right_cmd_velocity_msg);
+
+    std_msgs::Float32 wheel_left_sp_velocity_msg = std_msgs::Float32();
+    wheel_left_sp_velocity_msg.data = wheel_speed_[LEFT];
+    wheel_left_sp_velocity_publisher_.publish(wheel_left_sp_velocity_msg);
+    std_msgs::Float32 wheel_right_sp_velocity_msg = std_msgs::Float32();
+    wheel_right_sp_velocity_msg.data = wheel_speed_[RIGHT];
+    wheel_right_sp_velocity_publisher_.publish(wheel_right_sp_velocity_msg);
+
+    std_msgs::Float32 wheel_left_err_velocity_msg = std_msgs::Float32();
+    wheel_left_err_velocity_msg.data = wheel_speed_instr_[LEFT] - current_speed[LEFT];
+    wheel_left_err_velocity_publisher_.publish(wheel_left_err_velocity_msg);
+    std_msgs::Float32 wheel_right_err_velocity_msg = std_msgs::Float32();
+    wheel_right_err_velocity_msg.data = wheel_speed_instr_[RIGHT] - current_speed[RIGHT];
+    wheel_right_err_velocity_publisher_.publish(wheel_right_err_velocity_msg);
+
 }
 
 void GazeboRosDiffDrive::publishWheelTF()
@@ -302,10 +346,6 @@ void GazeboRosDiffDrive::UpdateChild()
           PublishGroundTruthTf();
         }
 
-        if (this->publish_tf_) publishOdometry ( seconds_since_last_update );
-        if ( publishWheelTF_ ) publishWheelTF();
-        if ( publishWheelJointState_ ) publishWheelJointState();
-
         // Update robot in case new velocities have been requested
         getWheelVelocities();
 
@@ -314,13 +354,14 @@ void GazeboRosDiffDrive::UpdateChild()
         current_speed[LEFT] = joints_[LEFT]->GetVelocity ( 0 )   * ( wheel_diameter_ / 2.0 );
         current_speed[RIGHT] = joints_[RIGHT]->GetVelocity ( 0 ) * ( wheel_diameter_ / 2.0 );
 
-        if ( wheel_accel == 0 ||
-                ( fabs ( wheel_speed_[LEFT] - current_speed[LEFT] ) < 0.01 ) ||
-                ( fabs ( wheel_speed_[RIGHT] - current_speed[RIGHT] ) < 0.01 ) ) {
+        if ( wheel_accel == 0 || (( fabs ( wheel_speed_[LEFT] - current_speed[LEFT] ) < 0.01 ) || ( fabs ( wheel_speed_[RIGHT] - current_speed[RIGHT] ) < 0.01 ) )) {
+
             //if max_accel == 0, or target speed is reached
-            joints_[LEFT]->SetParam ( "vel", 0, wheel_speed_[LEFT]/ ( wheel_diameter_ / 2.0 ) );
-            joints_[RIGHT]->SetParam ( "vel", 0, wheel_speed_[RIGHT]/ ( wheel_diameter_ / 2.0 ) );
+            wheel_speed_instr_[LEFT] = wheel_speed_[LEFT];
+            wheel_speed_instr_[RIGHT] = wheel_speed_[RIGHT];
+
         } else {
+
             if ( wheel_speed_[LEFT]>=current_speed[LEFT] )
                 wheel_speed_instr_[LEFT]+=fmin ( wheel_speed_[LEFT]-current_speed[LEFT],  wheel_accel * seconds_since_last_update );
             else
@@ -334,9 +375,15 @@ void GazeboRosDiffDrive::UpdateChild()
             // ROS_INFO_NAMED("diff_drive", "actual wheel speed = %lf, issued wheel speed= %lf", current_speed[LEFT], wheel_speed_[LEFT]);
             // ROS_INFO_NAMED("diff_drive", "actual wheel speed = %lf, issued wheel speed= %lf", current_speed[RIGHT],wheel_speed_[RIGHT]);
 
-            joints_[LEFT]->SetParam ( "vel", 0, wheel_speed_instr_[LEFT] / ( wheel_diameter_ / 2.0 ) );
-            joints_[RIGHT]->SetParam ( "vel", 0, wheel_speed_instr_[RIGHT] / ( wheel_diameter_ / 2.0 ) );
         }
+
+        joints_[LEFT]->SetParam ( "vel", 0, wheel_speed_instr_[LEFT] / ( wheel_diameter_ / 2.0 ) );
+        joints_[RIGHT]->SetParam ( "vel", 0, wheel_speed_instr_[RIGHT] / ( wheel_diameter_ / 2.0 ) );
+
+        if (this->publish_tf_) publishOdometry ( seconds_since_last_update );
+        if ( publishWheelTF_ ) publishWheelTF();
+        if ( publishWheelJointState_ ) publishWheelJointState();
+
         last_update_time_+= common::Time ( update_period_ );
     }
 }

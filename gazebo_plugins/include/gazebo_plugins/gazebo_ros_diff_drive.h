@@ -114,8 +114,19 @@ namespace gazebo {
       ros::Publisher odometry_publisher_;
       ros::Subscriber cmd_vel_subscriber_;
       boost::shared_ptr<tf::TransformBroadcaster> transform_broadcaster_;
+
       sensor_msgs::JointState joint_state_;
       ros::Publisher joint_state_publisher_;
+
+      ros::Publisher wheel_left_velocity_publisher_;
+      ros::Publisher wheel_right_velocity_publisher_;
+      ros::Publisher wheel_left_sp_velocity_publisher_;
+      ros::Publisher wheel_right_sp_velocity_publisher_;
+      ros::Publisher wheel_left_err_velocity_publisher_;
+      ros::Publisher wheel_right_err_velocity_publisher_;
+      ros::Publisher wheel_left_cmd_velocity_publisher_;
+      ros::Publisher wheel_right_cmd_velocity_publisher_;
+
       nav_msgs::Odometry odom_;
       std::string tf_prefix_;
 
