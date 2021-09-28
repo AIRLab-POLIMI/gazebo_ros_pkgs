@@ -90,7 +90,7 @@ public:
   /// \param[in] _current_time Current simulation time
   void PublishOdometryTf(const gazebo::common::Time & _current_time);
 
-  /// Publish trasforms for the wheels
+  /// Publish transforms for the wheels
   /// \param[in] _current_time Current simulation time
   void PublishWheelsTf(const gazebo::common::Time & _current_time);
 
@@ -315,13 +315,13 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
     "left_steering_i_range", ignition::math::Vector2d::Zero).first;
   impl_->pid_left_steering_.Init(pid.X(), pid.Y(), pid.Z(), i_range.Y(), i_range.X());
 
-  pid = _sdf->Get<ignition::math::Vector3d>(
-    "linear_velocity_pid_gain", ignition::math::Vector3d::Zero).first;
-  i_range = _sdf->Get<ignition::math::Vector2d>(
-    "linear_velocity_i_range", ignition::math::Vector2d::Zero).first;
-  impl_->pid_linear_vel_.Init(pid.X(), pid.Y(), pid.Z(), i_range.Y(), i_range.X());
+  pid = _sdf->Get<ignition::math::Vector3d>("linear_velocity_pid_gain", ignition::math::Vector3d::Zero).first;
+  i_range = _sdf->Get<ignition::math::Vector2d>("linear_velocity_i_range", ignition::math::Vector2d::Zero).first;
+  auto cmd_range = _sdf->Get<ignition::math::Vector2d>("linear_velocity_pid_cmd_range",
+                                                       ignition::math::Vector2d(0, -1)).first;
+  impl_->pid_linear_vel_.Init(pid.X(), pid.Y(), pid.Z(), i_range.Y(), i_range.X(), cmd_range.Y(), cmd_range.X());
 
-  // Update wheel radiu for wheel from SDF collision objects
+  // Update wheel radius for wheel from SDF collision objects
   // assumes that wheel link is child of joint (and not parent of joint)
   // assumes that wheel link has only one collision
   // assumes all wheel of both rear wheels of same radii
@@ -505,12 +505,14 @@ void GazeboRosAckermannDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo &
   IGN_PROFILE_BEGIN("update");
 #endif
   // Current speed assuming equal for left rear and right rear
-  auto linear_vel = joints_[REAR_RIGHT]->GetVelocity(0);
-  auto target_linear = ignition::math::clamp(target_linear_, -max_speed_, max_speed_);
-  double linear_diff = linear_vel - target_linear / wheel_radius_;
-  double linear_cmd = pid_linear_vel_.Update(linear_diff, seconds_since_last_update);
+  auto target_linear_vel = ignition::math::clamp(target_linear_, -max_speed_, max_speed_);
+  auto rear_left_angular_vel = joints_[REAR_LEFT]->GetVelocity(0);
+  auto rear_right_angular_vel = joints_[REAR_RIGHT]->GetVelocity(0);
+  auto current_linear_vel = (rear_left_angular_vel + rear_right_angular_vel) / 2 * wheel_radius_;
+  double linear_vel_diff = current_linear_vel - target_linear_vel;
+  double linear_cmd = pid_linear_vel_.Update(linear_vel_diff, seconds_since_last_update);
 
-  auto target_rot = target_rot_ * copysign(1.0, target_linear_);
+  auto target_rot = target_rot_;
   target_rot = ignition::math::clamp(target_rot, -max_steer_, max_steer_);
 
   double tanSteer = tan(target_rot);
