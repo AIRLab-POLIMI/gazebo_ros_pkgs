@@ -726,7 +726,7 @@ void GazeboRosDiffDrivePrivate::UpdateOdometryWorld()
   odom_.twist.twist.angular.z = model_->WorldAngularVel().Z();
 
   // Convert velocity to child_frame_id(aka base_footprint)
-  float yaw = pose.Rot().Yaw();
+  float yaw = static_cast<float>(pose.Rot().Yaw());
   odom_.twist.twist.linear.x = cosf(yaw) * linear.X() + sinf(yaw) * linear.Y();
   odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
 }
@@ -742,7 +742,7 @@ void GazeboRosDiffDrivePrivate::UpdateGroundTruthWorld()
   ground_truth_odom_.twist.twist.angular.z = model_->WorldAngularVel().Z();
 
   // Convert velocity to child_frame_id
-  float yaw = pose.Rot().Yaw();
+  float yaw = static_cast<float>(pose.Rot().Yaw());
   ground_truth_odom_.twist.twist.linear.x = cosf(yaw) * linear.X() + sinf(yaw) * linear.Y();
   ground_truth_odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
 }
