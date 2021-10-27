@@ -23,6 +23,7 @@
 #include <gazebo_ros/conversions/builtin_interfaces.hpp>
 #include <gazebo_ros/conversions/geometry_msgs.hpp>
 #include <gazebo_ros/node.hpp>
+#include <geometry_msgs/msg/pose2_d.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #ifdef IGN_PROFILER_ENABLE
 #include <ignition/common/Profiler.hh>
@@ -44,6 +45,19 @@ namespace gazebo_plugins
 class GazeboRosAckermannDrivePrivate
 {
 public:
+  /// Indicates where the odometry info is coming from
+  enum OdomSource
+  {
+      /// Use an encoder
+      ENCODER = 0,
+
+      /// Use ground truth from simulation world
+      WORLD = 1,
+
+      /// Use the parametric error model from Probabilistic Robotics (3rd Ed.) p. 136
+      PARAMETRIC_ERROR_MODEL = 2,
+  };
+
   /// Indicates which joint
   enum
   {
@@ -83,12 +97,29 @@ public:
   /// \return If the collision shape is invalid, return 0
   double CollisionRadius(const gazebo::physics::CollisionPtr & _coll);
 
+  /// Update odometry according to encoder.
+  /// \param[in] _current_time Current simulation time
+  void UpdateOdometryEncoder(const gazebo::common::Time & _current_time);
+
+  /// Update ground truth according to world
+  void UpdateGroundTruthWorld();
+
+  /// Update distance
+  void UpdateDistance();
+
   /// Update odometry according to world
   void UpdateOdometryWorld();
+
+  /// Update odometry according to the parametric error model
+  void UpdateOdometryParametricErrorModel(const gazebo::common::Time & _current_time);
 
   /// Publish odometry transforms
   /// \param[in] _current_time Current simulation time
   void PublishOdometryTf(const gazebo::common::Time & _current_time);
+
+  /// Publish ground truth transforms
+  /// \param[in] _current_time Current simulation time
+  void PublishGroundTruthTf(const gazebo::common::Time & _current_time);
 
   /// Publish transforms for the wheels
   /// \param[in] _current_time Current simulation time
@@ -98,6 +129,10 @@ public:
   /// \param[in] _current_time Current simulation time
   void PublishOdometryMsg(const gazebo::common::Time & _current_time);
 
+  /// Publish ground truth messages
+  /// \param[in] _current_time Current simulation time
+  void PublishGroundTruthMsg(const gazebo::common::Time & _current_time);
+
   /// A pointer to the GazeboROS node.
   gazebo_ros::Node::SharedPtr ros_node_;
 
@@ -106,6 +141,9 @@ public:
 
   /// Odometry publisher
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
+
+  /// Ground truth publisher
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr ground_truth_pub_;
 
   /// Distance publisher
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr distance_pub_;
@@ -119,8 +157,11 @@ public:
   /// Pointer to model.
   gazebo::physics::ModelPtr model_;
 
-  /// Distance between the wheels, in meters.
-  double wheel_separation_;
+  /// Distance between the front wheels, in meters.
+  double front_wheel_separation_;
+
+  /// Distance between the rear wheels, in meters.
+  double rear_wheel_separation_;
 
   /// Distance between front and rear axles, in meters.
   double wheel_base_;
@@ -155,11 +196,41 @@ public:
   /// Last update time.
   gazebo::common::Time last_update_time_;
 
+  /// Keep encoder data.
+  geometry_msgs::msg::Pose2D pose_encoder_;
+
+  /// Keep latest world odometry pose
+  geometry_msgs::msg::Pose2D last_pose_;
+
+  /// Keep odometry pose from error model
+  geometry_msgs::msg::Pose2D pose_error_model_;
+
   /// Odometry frame ID
   std::string odometry_frame_;
 
+  /// Ground truth parent frame ID
+  std::string ground_truth_parent_frame_;
+
+  /// Ground truth robot base frame ID
+  std::string ground_truth_robot_base_frame_;
+
+  /// Last time the encoder was updated
+  gazebo::common::Time last_encoder_update_;
+
+  /// Last time the odometry error model was updated
+  gazebo::common::Time last_odometry_error_model_update_;
+
+  /// Either ENCODER, WORLD or PARAMETRIC_ERROR_MODEL
+  OdomSource odom_source_;
+
   /// Keep latest odometry message
   nav_msgs::msg::Odometry odom_;
+
+  /// Keep latest odometry message to compute the distance
+  nav_msgs::msg::Odometry distance_odom_;
+
+  /// Keep latest ground truth message
+  nav_msgs::msg::Odometry ground_truth_odom_;
 
   /// Keep latest distance message
   std_msgs::msg::Float32 distance_;
@@ -170,6 +241,9 @@ public:
   /// True to publish odometry messages.
   bool publish_odom_;
 
+  /// True to publish ground truth messages.
+  bool publish_ground_truth_;
+
   /// True to publish distance travelled
   bool publish_distance_;
 
@@ -178,6 +252,9 @@ public:
 
   /// True to publish odom-to-world transforms.
   bool publish_odom_tf_;
+
+  /// True to publish ground truth transforms.
+  bool publish_ground_truth_tf_;
 
   /// Covariance in odometry
   double covariance_[3];
@@ -190,6 +267,10 @@ public:
 
   /// PID control for linear velocity control
   gazebo::common::PID pid_linear_vel_;
+
+  /// Parameters of odometry error model
+  double alpha1_, alpha2_, alpha3_, alpha4_;
+
 };
 
 GazeboRosAckermannDrive::GazeboRosAckermannDrive()
@@ -341,15 +422,14 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
   auto rear_left_center_pos = impl_->joints_[GazeboRosAckermannDrivePrivate::REAR_LEFT]->
     GetChild()->GetCollision(id)->WorldPose().Pos();
 
-  auto distance = front_left_center_pos - front_right_center_pos;
-  impl_->wheel_separation_ = distance.Length();
+  impl_->front_wheel_separation_ = (front_left_center_pos - front_right_center_pos).Length();
+  impl_->rear_wheel_separation_ = (rear_left_center_pos - rear_right_center_pos).Length();
 
   // to compute wheelbase, first position of axle centers are computed
   auto front_axle_pos = (front_left_center_pos + front_right_center_pos) / 2;
   auto rear_axle_pos = (rear_left_center_pos + rear_right_center_pos) / 2;
   // then the wheelbase is the distance between the axle centers
-  distance = front_axle_pos - rear_axle_pos;
-  impl_->wheel_base_ = distance.Length();
+  impl_->wheel_base_ = (front_axle_pos - rear_axle_pos).Length();
 
   // Update rate
   auto update_rate = _sdf->Get<double>("update_rate", 100.0).first;
@@ -370,6 +450,33 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
   // Odometry
   impl_->odometry_frame_ = _sdf->Get<std::string>("odometry_frame", "odom").first;
   impl_->robot_base_frame_ = _sdf->Get<std::string>("robot_base_frame", "base_footprint").first;
+  impl_->odom_source_ = static_cast<GazeboRosAckermannDrivePrivate::OdomSource>(
+          _sdf->Get<int>("odometry_source", GazeboRosAckermannDrivePrivate::OdomSource::WORLD).first);
+
+  // Ground truth
+  impl_->publish_ground_truth_tf_ = _sdf->Get<bool>("publish_ground_truth_tf", false).first;
+  impl_->ground_truth_parent_frame_ = _sdf->Get<std::string>("ground_truth_parent_frame", "map").first;
+  impl_->ground_truth_robot_base_frame_ = _sdf->Get<std::string>("ground_truth_robot_base_frame",
+                                                                 "base_footprint_gt").first;
+
+  // Odometry error model parameters
+  if (impl_->odom_source_ == GazeboRosAckermannDrivePrivate::OdomSource::PARAMETRIC_ERROR_MODEL) {
+    impl_->alpha1_ = _sdf->Get<double>("alpha1", 0.001).first;
+    impl_->alpha2_ = _sdf->Get<double>("alpha2", 0.001).first;
+    impl_->alpha3_ = _sdf->Get<double>("alpha3", 0.001).first;
+    impl_->alpha4_ = _sdf->Get<double>("alpha4", 0.001).first;
+
+    RCLCPP_INFO(impl_->ros_node_->get_logger(),
+                "Computing odometry with parametric error model\n"
+                "alpha1 [%f]\n"
+                "alpha2 [%f]\n"
+                "alpha3 [%f]\n"
+                "alpha4 [%f]\n",
+                impl_->alpha1_,
+                impl_->alpha2_,
+                impl_->alpha3_,
+                impl_->alpha4_);
+  }
 
   // Advertise odometry topic
   impl_->publish_odom_ = _sdf->Get<bool>("publish_odom", false).first;
@@ -380,6 +487,17 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
     RCLCPP_INFO(
       impl_->ros_node_->get_logger(), "Advertise odometry on [%s]",
       impl_->odometry_pub_->get_topic_name());
+  }
+
+  // Advertise ground truth topic
+  impl_->publish_ground_truth_ = _sdf->Get<bool>("publish_ground_truth", false).first;
+  if (impl_->publish_ground_truth_) {
+    impl_->ground_truth_pub_ = impl_->ros_node_->create_publisher<nav_msgs::msg::Odometry>(
+            "ground_truth_odom", qos.get_publisher_qos("ground_truth_odom", rclcpp::QoS(1)));
+
+    RCLCPP_INFO(
+            impl_->ros_node_->get_logger(), "Advertise ground truth on [%s]",
+            impl_->ground_truth_pub_->get_topic_name());
   }
 
   // Advertise distance travelled
@@ -396,7 +514,7 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
   // Create TF broadcaster if needed
   impl_->publish_wheel_tf_ = _sdf->Get<bool>("publish_wheel_tf", false).first;
   impl_->publish_odom_tf_ = _sdf->Get<bool>("publish_odom_tf", false).first;
-  if (impl_->publish_wheel_tf_ || impl_->publish_odom_tf_) {
+  if (impl_->publish_wheel_tf_ || impl_->publish_odom_tf_ || impl_->publish_ground_truth_tf_) {
     impl_->transform_broadcaster_ =
       std::make_shared<tf2_ros::TransformBroadcaster>(impl_->ros_node_);
 
@@ -415,6 +533,14 @@ void GazeboRosAckermannDrive::Load(gazebo::physics::ModelPtr _model, sdf::Elemen
           impl_->robot_base_frame_.c_str(), joint->GetName().c_str(), joint->GetName().c_str());
       }
     }
+
+    if (impl_->publish_ground_truth_tf_) {
+      RCLCPP_INFO(impl_->ros_node_->get_logger(),
+                  "Publishing ground truth odom transforms between [%s] and [%s]",
+                  impl_->ground_truth_parent_frame_.c_str(),
+                  impl_->ground_truth_robot_base_frame_.c_str());
+    }
+
   }
 
   auto pose = impl_->model_->WorldPose();
@@ -452,8 +578,30 @@ void GazeboRosAckermannDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo &
 #ifdef IGN_PROFILER_ENABLE
   IGN_PROFILE_BEGIN("UpdateOdometryWorld");
 #endif
-  // Update odom
-  UpdateOdometryWorld();
+  // Update odom message
+  if (odom_source_ == WORLD) {
+    UpdateOdometryWorld();
+  }
+
+  // Update encoder even if we're going to skip this update
+  if (odom_source_ == ENCODER) {
+    UpdateOdometryEncoder(_info.simTime);
+  }
+
+  // Update odom message if using parametric error model
+  if (odom_source_ == PARAMETRIC_ERROR_MODEL) {
+    UpdateOdometryParametricErrorModel(_info.simTime);
+  }
+
+  // Update distance
+  if (publish_distance_) {
+    UpdateDistance();
+  }
+
+  // Update ground truth message if using ground truth
+  if (publish_ground_truth_tf_) {
+    UpdateGroundTruthWorld();
+  }
 #ifdef IGN_PROFILER_ENABLE
   IGN_PROFILE_END();
 #endif
@@ -471,40 +619,46 @@ void GazeboRosAckermannDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo &
 #endif
   }
 
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_BEGIN("PublishOdometryMsg");
+#endif
   if (publish_odom_) {
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_BEGIN("PublishOdometryMsg");
-#endif
     PublishOdometryMsg(_info.simTime);
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_END();
-#endif
   }
+  if (publish_ground_truth_) {
+    PublishGroundTruthMsg(_info.simTime);
+  }
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_END();
+#endif
 
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_BEGIN("PublishWheelsTf");
+#endif
   if (publish_wheel_tf_) {
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_BEGIN("PublishWheelsTf");
-#endif
     PublishWheelsTf(_info.simTime);
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_END();
-#endif
   }
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_END();
+#endif
 
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_BEGIN("PublishOdometryTf");
+#endif
   if (publish_odom_tf_) {
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_BEGIN("PublishOdometryTf");
-#endif
     PublishOdometryTf(_info.simTime);
-#ifdef IGN_PROFILER_ENABLE
-    IGN_PROFILE_END();
-#endif
   }
+  if (publish_ground_truth_tf_) {
+    PublishGroundTruthTf(_info.simTime);
+  }
+#ifdef IGN_PROFILER_ENABLE
+  IGN_PROFILE_END();
+#endif
 
 #ifdef IGN_PROFILER_ENABLE
   IGN_PROFILE_BEGIN("update");
 #endif
-  // Current speed assuming equal for left rear and right rear
+  // Current speed
   auto target_linear_vel = ignition::math::clamp(target_linear_, -max_speed_, max_speed_);
   auto rear_left_angular_vel = joints_[REAR_LEFT]->GetVelocity(0);
   auto rear_right_angular_vel = joints_[REAR_RIGHT]->GetVelocity(0);
@@ -518,9 +672,9 @@ void GazeboRosAckermannDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo &
   double tanSteer = tan(target_rot);
 
   auto target_left_steering =
-    atan2(tanSteer, 1.0 - wheel_separation_ / 2.0 / wheel_base_ * tanSteer);
+    atan2(tanSteer, 1.0 - front_wheel_separation_ / 2.0 / wheel_base_ * tanSteer);
   auto target_right_steering =
-    atan2(tanSteer, 1.0 + wheel_separation_ / 2.0 / wheel_base_ * tanSteer);
+    atan2(tanSteer, 1.0 + front_wheel_separation_ / 2.0 / wheel_base_ * tanSteer);
 
   auto left_steering_angle = joints_[STEER_LEFT]->Position(0);
   auto right_steering_angle = joints_[STEER_RIGHT]->Position(0);
@@ -574,16 +728,72 @@ double GazeboRosAckermannDrivePrivate::CollisionRadius(const gazebo::physics::Co
   return 0;
 }
 
+void GazeboRosAckermannDrivePrivate::UpdateOdometryEncoder(const gazebo::common::Time & _current_time)
+{
+  double vl = joints_[REAR_LEFT]->GetVelocity(0);
+  double vr = joints_[REAR_RIGHT]->GetVelocity(0);
+
+  double seconds_since_last_update = (_current_time - last_encoder_update_).Double();
+  last_encoder_update_ = _current_time;
+
+  double b = rear_wheel_separation_;
+
+  // Book: Sigwart 2011 Autonomous Mobile Robots page:337
+  double sl = vl * wheel_radius_ * seconds_since_last_update;
+  double sr = vr * wheel_radius_ * seconds_since_last_update;
+  double ssum = sl + sr;
+
+  double sdiff = sr - sl;
+
+  double dx = (ssum) / 2.0 * cos(pose_encoder_.theta + (sdiff) / (2.0 * b));
+  double dy = (ssum) / 2.0 * sin(pose_encoder_.theta + (sdiff) / (2.0 * b));
+  double dtheta = (sdiff) / b;
+
+  pose_encoder_.x += dx;
+  pose_encoder_.y += dy;
+  pose_encoder_.theta += dtheta;
+
+  double w = dtheta / seconds_since_last_update;
+  double v = sqrt(dx * dx + dy * dy) / seconds_since_last_update;
+
+  tf2::Quaternion qt;
+  tf2::Vector3 vt;
+  qt.setRPY(0, 0, pose_encoder_.theta);
+  vt = tf2::Vector3(pose_encoder_.x, pose_encoder_.y, 0);
+
+  odom_.pose.pose.position.x = vt.x();
+  odom_.pose.pose.position.y = vt.y();
+  odom_.pose.pose.position.z = vt.z();
+
+  odom_.pose.pose.orientation.x = qt.x();
+  odom_.pose.pose.orientation.y = qt.y();
+  odom_.pose.pose.orientation.z = qt.z();
+  odom_.pose.pose.orientation.w = qt.w();
+
+  odom_.twist.twist.angular.z = w;
+  odom_.twist.twist.linear.x = v;
+  odom_.twist.twist.linear.y = 0;
+}
+
+void GazeboRosAckermannDrivePrivate::UpdateDistance()
+{
+  auto prev_x = distance_odom_.pose.pose.position.x;
+  auto prev_y = distance_odom_.pose.pose.position.y;
+
+  auto pose = model_->WorldPose();
+  distance_odom_.pose.pose.position = gazebo_ros::Convert<geometry_msgs::msg::Point>(pose.Pos());
+  distance_odom_.pose.pose.orientation = gazebo_ros::Convert<geometry_msgs::msg::Quaternion>(pose.Rot());
+
+  distance_.data += static_cast<float>(hypot(
+          prev_x - distance_odom_.pose.pose.position.x,
+          prev_y - distance_odom_.pose.pose.position.y));
+
+}
 void GazeboRosAckermannDrivePrivate::UpdateOdometryWorld()
 {
-  auto prev_x = odom_.pose.pose.position.x;
-  auto prev_y = odom_.pose.pose.position.y;
-
   auto pose = model_->WorldPose();
   odom_.pose.pose.position = gazebo_ros::Convert<geometry_msgs::msg::Point>(pose.Pos());
   odom_.pose.pose.orientation = gazebo_ros::Convert<geometry_msgs::msg::Quaternion>(pose.Rot());
-
-  distance_.data += hypot(prev_x - odom_.pose.pose.position.x, prev_y - odom_.pose.pose.position.y);
 
   // Get velocity in odom frame
   auto linear = model_->WorldLinearVel();
@@ -595,6 +805,97 @@ void GazeboRosAckermannDrivePrivate::UpdateOdometryWorld()
   odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
 }
 
+void GazeboRosAckermannDrivePrivate::UpdateGroundTruthWorld()
+{
+  auto pose = model_->WorldPose();
+  ground_truth_odom_.pose.pose.position = gazebo_ros::Convert<geometry_msgs::msg::Point>(pose.Pos());
+  ground_truth_odom_.pose.pose.orientation = gazebo_ros::Convert<geometry_msgs::msg::Quaternion>(pose.Rot());
+
+  // Get velocity in odom frame
+  auto linear = model_->WorldLinearVel();
+  ground_truth_odom_.twist.twist.angular.z = model_->WorldAngularVel().Z();
+
+  // Convert velocity to child_frame_id
+  auto yaw = static_cast<float>(pose.Rot().Yaw());
+  ground_truth_odom_.twist.twist.linear.x = cosf(yaw) * linear.X() + sinf(yaw) * linear.Y();
+  ground_truth_odom_.twist.twist.linear.y = cosf(yaw) * linear.Y() - sinf(yaw) * linear.X();
+}
+
+void GazeboRosAckermannDrivePrivate::UpdateOdometryParametricErrorModel(const gazebo::common::Time & _current_time)
+{
+  auto pose = model_->WorldPose();
+  double seconds_since_last_update = (_current_time - last_odometry_error_model_update_).Double();
+  last_odometry_error_model_update_ = _current_time;
+
+  auto current_pose = geometry_msgs::msg::Pose2D();
+  current_pose.x = pose.Pos().X();
+  current_pose.y = pose.Pos().Y();
+  current_pose.theta = pose.Rot().Yaw();
+
+  auto delta = geometry_msgs::msg::Pose2D();
+  delta.x = current_pose.x - last_pose_.x;
+  delta.y = current_pose.y - last_pose_.y;
+  delta.theta = current_pose.theta - last_pose_.theta;
+  delta.theta = atan2(sin(delta.theta), cos(delta.theta));
+
+  double delta_trans = sqrt(std::pow(delta.x, 2) + std::pow(delta.y, 2));
+  double delta_rot1 = atan2(delta.y, delta.x) - last_pose_.theta;
+  delta_rot1 = atan2(sin(delta_rot1), cos(delta_rot1));
+
+  std::normal_distribution<double> delta_rot_rv(
+          (1 + alpha1_) * delta.theta + alpha2_ * delta_trans,
+          0.0
+  );
+
+  std::normal_distribution<double> delta_trans_rv(
+          (1 + alpha3_) * delta_trans + alpha4_ * delta.theta,
+          0.0
+  );
+//
+//  std::normal_distribution<double> delta_rot_rv(
+//          delta.theta,
+//          sqrt(std::pow(alpha1_ * delta.theta, 2) + std::pow(alpha2_ * delta_trans, 2))
+//  );
+//
+//  std::normal_distribution<double> delta_trans_rv(
+//          delta_trans,
+//          sqrt(std::pow(alpha3_ * delta_trans, 2) + std::pow(alpha4_ * delta.theta, 2))
+//  );
+
+  std::random_device rd{};
+  std::mt19937 rng{rd()};
+  double delta_rot_hat = delta_rot_rv(rng);
+  double delta_trans_hat = delta_trans_rv(rng);
+
+  // Add the delta with additional error to the odometry pose
+  pose_error_model_.x += delta_trans_hat * cos(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.y += delta_trans_hat * sin(pose_error_model_.theta + delta_rot1);
+  pose_error_model_.theta += delta_rot_hat;
+
+  // Compute the ros odometry message and tf
+  double w = delta_rot_hat / seconds_since_last_update;
+  double v = delta_trans_hat / seconds_since_last_update;
+  tf2::Quaternion qt;
+  tf2::Vector3 vt;
+  qt.setRPY(0, 0, pose_error_model_.theta);
+  vt = tf2::Vector3(pose_error_model_.x, pose_error_model_.y, 0);
+
+  odom_.pose.pose.position.x = vt.x();
+  odom_.pose.pose.position.y = vt.y();
+  odom_.pose.pose.position.z = vt.z();
+
+  odom_.pose.pose.orientation.x = qt.x();
+  odom_.pose.pose.orientation.y = qt.y();
+  odom_.pose.pose.orientation.z = qt.z();
+  odom_.pose.pose.orientation.w = qt.w();
+
+  odom_.twist.twist.angular.z = w;
+  odom_.twist.twist.linear.x = v;
+  odom_.twist.twist.linear.y = 0;
+
+  last_pose_ = current_pose;
+}
+
 void GazeboRosAckermannDrivePrivate::PublishOdometryTf(const gazebo::common::Time & _current_time)
 {
   geometry_msgs::msg::TransformStamped msg;
@@ -604,6 +905,18 @@ void GazeboRosAckermannDrivePrivate::PublishOdometryTf(const gazebo::common::Tim
   msg.transform.translation =
     gazebo_ros::Convert<geometry_msgs::msg::Vector3>(odom_.pose.pose.position);
   msg.transform.rotation = odom_.pose.pose.orientation;
+
+  transform_broadcaster_->sendTransform(msg);
+}
+
+void GazeboRosAckermannDrivePrivate::PublishGroundTruthTf(const gazebo::common::Time & _current_time)
+{
+  geometry_msgs::msg::TransformStamped msg;
+  msg.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(_current_time);
+  msg.header.frame_id = ground_truth_parent_frame_;
+  msg.child_frame_id = ground_truth_robot_base_frame_;
+  msg.transform.translation = gazebo_ros::Convert<geometry_msgs::msg::Vector3>(ground_truth_odom_.pose.pose.position);
+  msg.transform.rotation = ground_truth_odom_.pose.pose.orientation;
 
   transform_broadcaster_->sendTransform(msg);
 }
@@ -649,5 +962,32 @@ void GazeboRosAckermannDrivePrivate::PublishOdometryMsg(const gazebo::common::Ti
   // Publish
   odometry_pub_->publish(odom_);
 }
+
+void GazeboRosAckermannDrivePrivate::PublishGroundTruthMsg(const gazebo::common::Time & _current_time)
+{
+  // Set covariance
+  ground_truth_odom_.pose.covariance[0] = covariance_[0];
+  ground_truth_odom_.pose.covariance[7] = covariance_[1];
+  ground_truth_odom_.pose.covariance[14] = 1000000000000.0;
+  ground_truth_odom_.pose.covariance[21] = 1000000000000.0;
+  ground_truth_odom_.pose.covariance[28] = 1000000000000.0;
+  ground_truth_odom_.pose.covariance[35] = covariance_[2];
+
+  ground_truth_odom_.twist.covariance[0] = covariance_[0];
+  ground_truth_odom_.twist.covariance[7] = covariance_[1];
+  ground_truth_odom_.twist.covariance[14] = 1000000000000.0;
+  ground_truth_odom_.twist.covariance[21] = 1000000000000.0;
+  ground_truth_odom_.twist.covariance[28] = 1000000000000.0;
+  ground_truth_odom_.twist.covariance[35] = covariance_[2];
+
+  // Set header
+  ground_truth_odom_.header.frame_id = ground_truth_parent_frame_;
+  ground_truth_odom_.child_frame_id = ground_truth_robot_base_frame_;
+  ground_truth_odom_.header.stamp = gazebo_ros::Convert<builtin_interfaces::msg::Time>(_current_time);
+
+  // Publish
+  ground_truth_pub_->publish(ground_truth_odom_);
+}
+
 GZ_REGISTER_MODEL_PLUGIN(GazeboRosAckermannDrive)
 }  // namespace gazebo_plugins
