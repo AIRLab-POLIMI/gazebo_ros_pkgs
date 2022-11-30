@@ -572,14 +572,24 @@ void GazeboRosDiffDrive::UpdateOdometryParametricErrorModel()
   double delta_rot1 = atan2(delta.y, delta.x) - last_pose_.theta;
   delta_rot1 = atan2(sin(delta_rot1), cos(delta_rot1));
 
+  // std::normal_distribution<double> delta_rot_rv(
+  //   delta.theta,
+  //   sqrt(std::pow(alpha1_ * delta.theta, 2) + std::pow(alpha2_ * delta_trans, 2))
+  // );
+
+  // std::normal_distribution<double> delta_trans_rv(
+  //   delta_trans,
+  //   sqrt(std::pow(alpha3_ * delta_trans, 2) + std::pow(alpha4_ * delta.theta, 2))
+  // );
+
   std::normal_distribution<double> delta_rot_rv(
-    delta.theta,
-    sqrt(std::pow(alpha1_ * delta.theta, 2) + std::pow(alpha2_ * delta_trans, 2))
+          (1 + alpha1_) * delta.theta + alpha2_ * delta_trans,
+          0.0
   );
 
   std::normal_distribution<double> delta_trans_rv(
-    delta_trans,
-    sqrt(std::pow(alpha3_ * delta_trans, 2) + std::pow(alpha4_ * delta.theta, 2))
+          (1 + alpha3_) * delta_trans + alpha4_ * delta.theta,
+          0.0
   );
 
   std::random_device rd{};
